@@ -1,0 +1,12 @@
+[project]
+name = "radar"
+version = "0.1.0"
+description = "Structured state for a 2027 new-grad software job digest"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+radar = "radar.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

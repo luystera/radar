@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # No dependencies: radar is standard library only, and the test suite
+      # touches no network. pytest is the single dev requirement.
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Run tests
+        run: python -m pytest tests/ -q
+
+      # Proves the whole pipeline still runs end to end against the committed
+      # fixtures, which is the part a unit test cannot cover.
+      - name: Offline pipeline smoke test
+        run: |
+          python -m radar.cli --db "${RUNNER_TEMP}/ci.db" sync --offline fixtures --baseline
+          python -m radar.cli --db "${RUNNER_TEMP}/ci.db" stats
+          python -m radar.cli --db "${RUNNER_TEMP}/ci.db" render --out "${RUNNER_TEMP}/digest.html"
+          test -s "${RUNNER_TEMP}/digest.html"

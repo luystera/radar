@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.db
+applied.json
+digest.html
+out.html
+.pytest_cache/
+
+# State exports and agent scratch output. These carry the full verdict history
+# and the applied-role ledger, so they must never reach a public repo.
+state.json
+state-*.json
+work.json
+*.tgz

@@ -1,0 +1,8 @@
+# Normalize line endings in the repository regardless of the platform a commit
+# is made from. Without this, a clone on Windows can commit CRLF, which then
+# shows up as a whole-file diff for anyone on Linux or macOS.
+* text=auto eol=lf
+
+# Committed tracker snapshots are test fixtures: byte-for-byte stability
+# matters more than platform convenience.
+fixtures/*.md -text
