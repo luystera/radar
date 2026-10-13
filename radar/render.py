@@ -122,12 +122,17 @@ def role_card(row, applied: dict | None = None) -> str:
             quoted = f'<div class="quote">{e(g["text"])}</div>'
             break
     note = row["verdict_why"] or row["notes"] or ""
+    # Built outside the f-string on purpose: nesting the same quote character
+    # and escaping a backslash inside an f-string expression is PEP 701, which
+    # landed in Python 3.12. This package supports 3.10, where that is a
+    # SyntaxError at import time.
+    open_a = '<a href="%s">' % e(row["url"]) if row["url"] else ""
+    close_a = "</a>" if row["url"] else ""
     return (
         f'    <div class="role{dim}"{hidden} data-role-id="{e(rid)}" '
         f'data-company="{e(row["company"])}" data-title="{e(row["title"])}" data-url="{e(row["url"])}">\n'
         f'      <div class="role-top"><div>\n'
-        f'        <div class="co">{f"<a href=\"{e(row['url'])}\">" if row["url"] else ""}'
-        f'{e(row["company"])}{"</a>" if row["url"] else ""}</div>\n'
+        f'        <div class="co">{open_a}{e(row["company"])}{close_a}</div>\n'
         f'        <div class="title">{e(row["title"])}</div>\n'
         f'        <div class="loc">{e(row["location"])}</div>\n'
         f'      </div></div>\n'
