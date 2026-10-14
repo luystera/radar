@@ -1,6 +1,7 @@
 """radar CLI.
 
   radar sync      [--offline DIR]     fetch trackers -> store, report new/seen
+  radar add       --company --url     enter a req the trackers do not carry
   radar worklist  [--limit N]         what the agent should verify today (JSON)
   radar verify    ROLE_ID --json ...  apply one verification
   radar render    --out FILE          render the page from the store
@@ -10,6 +11,7 @@
 from __future__ import annotations
 import argparse
 import json
+import re
 import sys
 from datetime import date, timedelta
 
@@ -66,12 +68,75 @@ def cmd_sync(a) -> int:
     return 0
 
 
+def cmd_add(a) -> int:
+    """Enter a requisition the trackers do not carry.
+
+    This is the intake path for STEP 4 of the daily run: the quant and prop
+    firms, the bank analyst programmes and the Long Island employers are not on
+    any of the three GitHub trackers, so a req found by searching had nowhere to
+    go -- verify() raises KeyError on an unknown role_id, by design, because a
+    typo must not create a row. add() creates the row; verify() still owns every
+    judged field.
+    """
+    if not re.match(r"^https?://\S+$", (a.url or "").strip()):
+        print("error: --url must be a real http(s) URL to the employer's own "
+              "posting -- never a search page and never invented", file=sys.stderr)
+        return 1
+    rid = role_id(a.company, a.url)
+    if not is_valid(rid):
+        print(f"error: computed role_id is not a usable document id: {rid!r}",
+              file=sys.stderr)
+        return 1
+    st = Store(a.db)
+    grp, miles = C.group_for(a.location or "")
+    res = st.add(Req(role_id=rid, company=a.company, title=a.title or "",
+                     url=a.url.strip(), location=a.location or "",
+                     group_label=grp, li_miles=miles, sources=["agent"]), a.today)
+    out = {"role_id": rid, "result": res, "group": grp}
+    # Warn, never refuse: these filters gate tracker volume, and is_software_role
+    # must not be used to second-guess a row an agent added deliberately.
+    warn = []
+    if res == "existing":
+        # Nothing was written, so report the row as it actually stands rather
+        # than the group and title this call would have used.
+        row = st.get(rid)
+        out["group"] = row["group_label"]
+        out["stored_title"] = row["title"]
+        out["verdict"] = row["verdict"]
+        warn.append("row already exists and was left untouched -- change judged "
+                    "fields with `verify`, not by re-adding")
+    else:
+        if a.title and C.is_internship(a.title):
+            warn.append("title reads as an internship -- tracker intake would skip "
+                        "it; confirm this is a full-time seat")
+        if a.title and not C.is_software_role(a.title):
+            warn.append("title carries no software token -- tracker intake would skip it")
+    if warn:
+        out["warnings"] = warn
+    if a.json:
+        try:
+            out["changed"] = st.verify(rid, json.loads(a.json), a.today)
+        except (KeyError, ValueError) as ex:
+            print(json.dumps(out, indent=1))
+            print(f"error: row exists but verify failed: {ex}", file=sys.stderr)
+            st.close()
+            return 1
+    print(json.dumps(out, indent=1))
+    st.close()
+    return 0
+
+
 def cmd_worklist(a) -> int:
     st = Store(a.db)
-    cutoff = (date.today() - timedelta(days=a.days)).isoformat()
-    rows = st.stale(cutoff, a.limit)
+    # Pre-existing bug, fixed here because the deadline ordering below is
+    # otherwise untestable: --today is documented as an override "for tests" but
+    # the cutoff was always computed from the real clock, so a --today run
+    # silently filtered against the wrong day.
+    base = date.fromisoformat(a.today) if a.today else date.today()
+    cutoff = (base - timedelta(days=a.days)).isoformat()
+    rows = st.stale(cutoff, a.limit, a.today)
     out = [{"role_id": r["role_id"], "company": r["company"], "title": r["title"],
-            "url": r["url"], "group": r["group_label"],
+            "url": r["url"], "group": r["group_label"], "deadline": r["deadline"],
             "last_verified": r["last_verified"], "clean_reads": r["clean_reads"]}
            for r in rows]
     print(json.dumps(out, indent=1))
@@ -194,6 +259,13 @@ def main(argv=None) -> int:
                    help="treat this sync as an import: discoveries are backdated "
                         "one day and logged as 'backfill', so the next run's delta is real")
     s.set_defaults(f=cmd_sync)
+    s = sub.add_parser("add")
+    s.add_argument("--company", required=True)
+    s.add_argument("--url", required=True, help="the employer's own posting URL")
+    s.add_argument("--title", default="")
+    s.add_argument("--location", default="", help="drives group A/LI/B/C and LI miles")
+    s.add_argument("--json", help="optional: verify the new row in the same call")
+    s.set_defaults(f=cmd_add)
     s = sub.add_parser("worklist");  s.add_argument("--limit", type=int, default=40)
     s.add_argument("--days", type=int, default=1); s.set_defaults(f=cmd_worklist)
     s = sub.add_parser("verify");    s.add_argument("role_id"); s.add_argument("--json", required=True)

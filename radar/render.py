@@ -93,7 +93,22 @@ def arrangement_chip(row) -> str:
     return f'<span class="chip {cls}">{e(a.title())} ({how})</span>'
 
 
-def role_card(row, applied: dict | None = None) -> str:
+def closes_within(deadline: str | None, today: str | None, days: int = 14) -> int | None:
+    """Days from `today` until `deadline`, or None when the deadline is absent,
+    is prose rather than a date, or is further out than `days`. Prose deadlines
+    are kept and displayed; only the urgency styling needs a real date."""
+    if not deadline:
+        return None
+    try:
+        d = date.fromisoformat(deadline.strip()[:10])
+        t = date.fromisoformat(today) if today else date.today()
+    except ValueError:
+        return None
+    left = (d - t).days
+    return left if left <= days else None
+
+
+def role_card(row, applied: dict | None = None, today: str | None = None) -> str:
     rid = row["role_id"]
     app = (applied or {}).get(rid)
     chips = [arrangement_chip(row)]
@@ -106,6 +121,23 @@ def role_card(row, applied: dict | None = None) -> str:
         chips.append(f'<span class="chip comp">{comp}</span>')
     if row["start_date"]:
         chips.append(f'<span class="chip fresh">Start {e(row["start_date"])}</span>')
+    if row["deadline"]:
+        left = closes_within(row["deadline"], today)
+        if left is None:
+            # Far off, or prose rather than a date. Prose is shown verbatim with
+            # no "Closes" prefix, since it usually already reads as a sentence.
+            raw = row["deadline"].strip()
+            is_date = len(raw) >= 10 and raw[:4].isdigit() and raw[4] == "-"
+            when, cls = (f"Closes {e(raw)}" if is_date else e(raw)), ""
+        elif left < 0:
+            when, cls = f"Closed {e(row['deadline'])}", "gate"
+        elif left == 0:
+            when, cls = f"Closes TODAY &middot; {e(row['deadline'])}", "gate"
+        else:
+            when = (f"Closes in {left} day{'' if left == 1 else 's'} "
+                    f"&middot; {e(row['deadline'])}")
+            cls = "gate"
+        chips.append(f'<span class="chip {cls}">{when}</span>')
     gates = json.loads(row["gates"] or "[]")
     for g in gates:
         if g.get("kind") == "floor":
@@ -144,7 +176,7 @@ def role_card(row, applied: dict | None = None) -> str:
     )
 
 
-def delta_section(new_rows, changes, closed) -> str:
+def delta_section(new_rows, changes, closed, today: str | None = None) -> str:
     if not (new_rows or changes or closed):
         body = ('<p class="sec-note"><b>Nothing opened, nothing closed and nothing changed '
                 'on a tracked requisition today.</b> The carried list below is unchanged; '
@@ -157,7 +189,7 @@ def delta_section(new_rows, changes, closed) -> str:
         out.append(f'    <p class="sec-note"><b>{len(new_rows)} newly discovered</b> '
                    '&mdash; first time any source has carried these.</p>\n')
         for r in new_rows:
-            out.append(role_card(r))
+            out.append(role_card(r, None, today))
     if changes:
         out.append('    <div class="watch"><dl>\n')
         for c in changes:
@@ -215,11 +247,11 @@ def page(store, applied: dict, new_rows, changes, closed, today: str | None = No
         if not rows:
             parts.append('    <p class="sec-note">Nothing open here that you have not already applied to.</p>\n')
         for r in rows:
-            parts.append(role_card(r, applied))
+            parts.append(role_card(r, applied, today))
         parts.append('  </section>\n')
     # The location groups come first because they are what he acts on. The
     # changes log and the applied ledger are reference, so they sit at the end.
-    parts.append(delta_section(new_rows, changes, closed))
+    parts.append(delta_section(new_rows, changes, closed, today))
     parts.append(_ledger(applied))
     parts.append('<script>\n' + (_T / 'tracker.js').read_text() + '</script>\n')
     parts.append('</div>\n')

@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS requisitions (
   arr_stated    INTEGER NOT NULL DEFAULT 0,
   cohort        TEXT,
   start_date    TEXT,
+  deadline      TEXT,                          -- application close date, ISO or prose
   gates         TEXT NOT NULL DEFAULT '[]',    -- json list of flagged bullets
   verdict       TEXT,                          -- apply|skip|watch
   verdict_why   TEXT,
@@ -64,13 +65,17 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 """
 
+# State-snapshot versions this code can read. 1 predates the `deadline` column;
+# 2 carries it. A snapshot is always written at the newest version.
+SUPPORTED_STATE_VERSIONS = frozenset({1, 2})
+
 # Fields a verification may update; anything else is rejected so a typo in a
 # --json payload fails loudly instead of being silently dropped.
 VERIFIABLE = {
     "title", "url", "location", "group_label", "li_miles", "live",
     "http_status", "comp_min", "comp_max", "comp_basis", "arrangement",
-    "arr_stated", "cohort", "start_date", "gates", "verdict", "verdict_why",
-    "notes",
+    "arr_stated", "cohort", "start_date", "deadline", "gates", "verdict",
+    "verdict_why", "notes",
 }
 
 
@@ -92,7 +97,19 @@ class Store:
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        self._migrate()
         self.db.commit()
+
+    # Columns added after a store was first created. CREATE TABLE IF NOT EXISTS
+    # does nothing to an existing table, so a db written by older code keeps its
+    # old column set and every read of the new field raises OperationalError.
+    ADDED_COLUMNS = (("deadline", "TEXT"),)
+
+    def _migrate(self) -> None:
+        have = {r["name"] for r in self.db.execute("PRAGMA table_info(requisitions)")}
+        for col, decl in self.ADDED_COLUMNS:
+            if col not in have:
+                self.db.execute(f"ALTER TABLE requisitions ADD COLUMN {col} {decl}")
 
     def close(self) -> None:
         self.db.close()
@@ -112,26 +129,11 @@ class Store:
             "SELECT role_id, sources FROM requisitions WHERE role_id=?", (r.role_id,)
         ).fetchone()
         if cur is None:
-            known = self.db.execute(
-                "SELECT first_seen FROM seen WHERE role_id=?", (r.role_id,)
-            ).fetchone()
-            first = known["first_seen"] if known else today
-            self.db.execute(
-                """INSERT INTO requisitions
-                   (role_id, company, title, url, location, group_label, li_miles,
-                    sources, first_seen, last_seen)
-                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (r.role_id, r.company, r.title, r.url, r.location, r.group_label,
-                 r.li_miles, json.dumps(sorted(set(r.sources))), first, today),
-            )
-            self.db.execute(
-                "INSERT OR IGNORE INTO seen(role_id, first_seen) VALUES (?,?)",
-                (r.role_id, first),
-            )
-            if known is None:
+            is_new = self._insert_req(r, today)
+            if is_new:
                 self.log(r.role_id, "discovered", f"{r.company} — {r.title}", today)
             self.db.commit()
-            return "new" if known is None else "seen"
+            return "new" if is_new else "seen"
         merged = sorted(set(json.loads(cur["sources"]) + list(r.sources)))
         self.db.execute(
             "UPDATE requisitions SET last_seen=?, sources=? WHERE role_id=?",
@@ -139,6 +141,53 @@ class Store:
         )
         self.db.commit()
         return "seen"
+
+    def _insert_req(self, r: Req, today: str) -> bool:
+        """Insert a fresh requisition row. Returns True when nothing had ever
+        seen this id before, False when it was already in the seen-set (so a
+        re-synced candidate is not reported as a fresh discovery). Shared by
+        upsert_seen and add so the column list lives in one place."""
+        known = self.db.execute(
+            "SELECT first_seen FROM seen WHERE role_id=?", (r.role_id,)
+        ).fetchone()
+        first = known["first_seen"] if known else today
+        self.db.execute(
+            """INSERT INTO requisitions
+               (role_id, company, title, url, location, group_label, li_miles,
+                sources, first_seen, last_seen)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (r.role_id, r.company, r.title, r.url, r.location, r.group_label,
+             r.li_miles, json.dumps(sorted(set(r.sources))), first, today),
+        )
+        self.db.execute(
+            "INSERT OR IGNORE INTO seen(role_id, first_seen) VALUES (?,?)",
+            (r.role_id, first),
+        )
+        return known is None
+
+    def add(self, r: Req, today: str | None = None) -> str:
+        """Create a row for a requisition an agent found by hand, so it can then
+        be judged through verify() like anything else.
+
+        Returns 'added' or 'existing'. Deliberately NOT an upsert: an existing
+        row carries judgement, and judgement changes through verify(), never by
+        re-adding. The caller computes role_id with ids.role_id(), the same
+        function sync uses, so when a tracker later carries the same req
+        upsert_seen merges into THIS row rather than creating a second one.
+
+        Intake filters (is_internship, is_software_role) are deliberately not
+        applied here: they are a gate on tracker volume, and is_software_role's
+        own docstring warns against using it on rows an agent added on purpose.
+        The CLI warns instead of refusing.
+        """
+        today = today or date.today().isoformat()
+        if self.db.execute("SELECT 1 FROM requisitions WHERE role_id=?",
+                           (r.role_id,)).fetchone():
+            return "existing"
+        self._insert_req(r, today)
+        self.log(r.role_id, "discovered", f"added by hand — {r.company} — {r.title}", today)
+        self.db.commit()
+        return "added"
 
     def verify(self, role_id: str, fields: dict[str, Any], today: str | None = None) -> list[str]:
         """Apply a verification. Increments clean_reads when live, resets on
@@ -258,7 +307,8 @@ class Store:
         """
         reqs = [dict(r) for r in self.db.execute(
             "SELECT * FROM requisitions WHERE verdict IS NOT NULL "
-            "OR sources LIKE '%digest-page%' OR clean_reads > 0")]
+            "OR sources LIKE '%digest-page%' OR sources LIKE '%agent%' "
+            "OR clean_reads > 0")]
         keep = {r["role_id"] for r in reqs}
         evs = [dict(r) for r in self.db.execute("SELECT * FROM events ORDER BY id")
                if dict(r)["role_id"] in keep]
@@ -271,14 +321,28 @@ class Store:
             "SELECT role_id, first_seen FROM requisitions")}
         seen.update({r["role_id"]: r["first_seen"] for r in self.db.execute(
             "SELECT role_id, first_seen FROM seen")})
-        return {"version": 1, "requisitions": reqs, "events": evs,
+        # Version 2 adds the `deadline` column. The bump is what makes a
+        # version-skewed run fail legibly: older code's own guard rejects an
+        # unknown version with a clean ValueError, which cmd_import catches and
+        # prints, instead of reaching the INSERT and dying on
+        # "table requisitions has no column named deadline" -- an unhandled
+        # OperationalError that kills the run with a traceback. This matters
+        # because the artifact holds a hand-updated MIRROR of this code used
+        # when the git clone fails: a stale mirror must refuse the snapshot, not
+        # crash on it, and must never silently drop a field and then export over
+        # the real state without it.
+        return {"version": 2, "requisitions": reqs, "events": evs,
                 "runs": runs, "seen": seen}
 
     def import_state(self, state: dict) -> dict:
         """Restore an export. Judged facts win over anything a sync wrote, since
         a verified read beats a tracker row."""
-        if state.get("version") != 1:
-            raise ValueError(f"unsupported state version: {state.get('version')!r}")
+        if state.get("version") not in SUPPORTED_STATE_VERSIONS:
+            raise ValueError(
+                f"unsupported state version: {state.get('version')!r} "
+                f"(this code reads {sorted(SUPPORTED_STATE_VERSIONS)}). A newer "
+                f"snapshot than the code means the code is stale -- most likely "
+                f"the artifact's mirror, used because the git clone failed.")
         nr = ne = 0
         for r in state.get("requisitions", []):
             cols = [k for k in r if k != "role_id"]
@@ -307,17 +371,27 @@ class Store:
         self.db.commit()
         return {"requisitions": nr, "events": ne}
 
-    def stale(self, before: str, limit: int = 60) -> list[sqlite3.Row]:
-        """Reqs most in need of re-verification: never verified first, then
-        oldest last_verified. This is the agent's work list."""
+    def stale(self, before: str, limit: int = 60,
+              today: str | None = None) -> list[sqlite3.Row]:
+        """Reqs most in need of re-verification. A deadline inside two weeks
+        outranks everything, because that is the one thing a day's delay can
+        cost outright; then group, then verdict, then staleness. A prose or
+        malformed deadline simply fails the date() comparison and sorts normally.
+        """
         return list(self.db.execute(
             """SELECT * FROM requisitions
                WHERE live != 'closed'
                  AND verdict IS NOT 'skip'
-                 AND (last_verified IS NULL OR last_verified < ?)
-               ORDER BY CASE group_label WHEN 'A' THEN 0 WHEN 'LI' THEN 1
+                 AND (last_verified IS NULL OR last_verified < :before)
+               ORDER BY CASE WHEN deadline IS NOT NULL
+                              AND date(deadline) >= date(:today)
+                              AND date(deadline) <= date(:today, '+14 days')
+                             THEN 0 ELSE 1 END,
+                        CASE group_label WHEN 'A' THEN 0 WHEN 'LI' THEN 1
                                          WHEN 'B' THEN 2 ELSE 3 END,
                         CASE verdict WHEN 'apply' THEN 0 WHEN 'watch' THEN 1 ELSE 2 END,
                         (last_verified IS NOT NULL), last_verified
-               LIMIT ?""", (before, limit)
+               LIMIT :limit""",
+            {"before": before, "limit": limit,
+             "today": today or date.today().isoformat()},
         ))
